@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import random
 import string
 from dotenv import load_dotenv, dotenv_values
-from typing import Dict, Any, Callable, Awaitable
+from typing import Dict, Any, Callable, Awaitable, Union
 import os
 from aiogram import Bot, Dispatcher, Router, BaseMiddleware, F
 from aiogram.filters import Command
@@ -59,7 +59,17 @@ class Database:
                 manager_id INTEGER NOT NULL
             )
         ''')
-
+        self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    telegram_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    role TEXT,
+                    project_id INTEGER,
+                    is_active INTEGER DEFAULT 0,
+                    FOREIGN KEY (project_id) REFERENCES projects (id)
+                )
+            ''')
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
@@ -110,16 +120,56 @@ class Database:
         self.connection.commit()
         return self.cursor.lastrowid
 
-    def add_user(self,
-                 telegram_id: int,
-                 name: str,
-                 project_id: int = None,
-                 role: str = None) -> int:
-        self.cursor.execute(
-            'INSERT INTO users (telegram_id, name, project_id, role) VALUES (?, ?, ?, ?)',
-            (telegram_id, name, project_id, role))
-        self.connection.commit()
-        return self.cursor.lastrowid
+    def get_active_project(self, telegram_id: int) -> tuple:
+        """Get user's currently active project"""
+        self.cursor.execute('''
+            SELECT p.* FROM projects p
+            JOIN users u ON p.id = u.project_id
+            WHERE u.telegram_id = ? AND u.is_active = 1
+        ''', (telegram_id,))
+        return self.cursor.fetchone()
+    
+    def get_active_user(self, telegram_id: int) -> tuple:
+        """Get user's currently active project"""
+        self.cursor.execute('''
+            SELECT id FROM users
+            WHERE telegram_id = ? AND is_active = 1
+        ''', (telegram_id,))
+        return self.cursor.fetchone()
+    
+    def get_active_role(self, telegram_id: int) -> tuple:
+        """Get user's currently active project"""
+        self.cursor.execute('''
+            SELECT role FROM users
+            WHERE telegram_id = ? AND is_active = 1
+        ''', (telegram_id,))
+        return self.cursor.fetchone()
+
+    def add_user(self, telegram_id: int, name: str, project_id: int = None, role: str = None) -> int:
+        """Add user to a project. If user exists in other projects, add new project entry."""
+        try:
+            # First check if user exists in this specific project
+            self.cursor.execute(
+                'SELECT id FROM users WHERE telegram_id = ? AND project_id = ?',
+                (telegram_id, project_id)
+            )
+            existing_user = self.cursor.fetchone()
+
+            if existing_user:
+                # User already exists in this project, return existing ID
+                return existing_user[0]
+
+            # Add new user entry for this project
+            self.cursor.execute(
+                'INSERT INTO users (telegram_id, name, project_id, role) VALUES (?, ?, ?, ?)',
+                (telegram_id, name, project_id, role)
+            )
+            self.connection.commit()
+            return self.cursor.lastrowid
+
+        except sqlite3.Error as e:
+            logging.error(f"Error in add_user: {e}")
+            raise
 
     def add_task(self,
                  project_id: int,
@@ -142,10 +192,10 @@ class Database:
         return self.cursor.fetchone()
 
     def get_project_by_id(self, project_id: int):
-        self.cursor.execute('SELECT * FROM projects WHERE id = ?',
-                            (project_id, ))
+        if project_id is None:
+            return None
+        self.cursor.execute('SELECT * FROM projects WHERE id = ?', (project_id,))
         return self.cursor.fetchone()
-
     def get_user_by_id(self, user_id: int):
         self.cursor.execute('SELECT * FROM users WHERE id = ?', (user_id, ))
         return self.cursor.fetchone()
@@ -196,6 +246,116 @@ class Database:
         )
         return [role[0] for role in self.cursor.fetchall()]
 
+    def get_user_active_project(self, telegram_id: int) -> tuple:
+        """Get user's currently active project along with their role"""
+        self.cursor.execute('''
+            SELECT p.*, u.role, u.id as user_id
+            FROM projects p
+            JOIN users u ON p.id = u.project_id
+            WHERE u.telegram_id = ? AND u.is_active = 1
+        ''', (telegram_id,))
+        return self.cursor.fetchone()
+    
+    def get_project_participants(self, project_id: int) -> list:
+        """Get all participants of a project with their roles"""
+        self.cursor.execute('''
+            SELECT u.name, u.role, u.telegram_id
+            FROM users u
+            WHERE u.project_id = ?
+            ORDER BY u.role, u.name
+        ''', (project_id,))
+        return self.cursor.fetchall()
+
+    # Add to the Database class
+    def get_user_projects(self, telegram_id: int) -> list:
+        """Get all projects where user is a member"""
+        self.cursor.execute('''
+            SELECT DISTINCT p.* 
+            FROM projects p
+            JOIN users u ON p.id = u.project_id
+            WHERE u.telegram_id = ?
+        ''', (telegram_id,))
+        return self.cursor.fetchall()
+
+    # Изменить метод в классе Database
+    def switch_user_project(self, telegram_id: int, project_id: int) -> bool:
+        """Switch user's active project"""
+        try:
+            # First verify the project exists
+            project = self.get_project_by_id(project_id)
+            if not project:
+                return False
+
+            # Update last_active status for all user's projects
+            self.cursor.execute('''
+                UPDATE users 
+                SET is_active = 0 
+                WHERE telegram_id = ?
+            ''', (telegram_id,))
+
+            # Set the selected project as active
+            self.cursor.execute('''
+                UPDATE users 
+                SET is_active = 1 
+                WHERE telegram_id = ? AND project_id = ?
+            ''', (telegram_id, project_id))
+
+            self.connection.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Error in switch_user_project: {e}")
+            return False
+
+    def delete_project(self, project_id: int) -> bool:
+        """Delete project and all related data"""
+        try:
+            self.cursor.execute('DELETE FROM tasks WHERE project_id = ?', (project_id,))
+            self.cursor.execute('DELETE FROM project_roles WHERE project_id = ?', (project_id,))
+            self.cursor.execute('DELETE FROM users WHERE project_id = ?', (project_id,))
+            self.cursor.execute('DELETE FROM projects WHERE id = ?', (project_id,))
+            self.connection.commit()
+            return True
+        except Exception:
+            return False
+        
+
+    def add_feedback(self, task_id: int, feedback: str, rating: int):
+        """Add feedback for completed task"""
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS task_feedback (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL,
+                feedback TEXT NOT NULL,
+                rating INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_id) REFERENCES tasks (id)
+            )
+        ''')
+        
+        self.cursor.execute(
+            'INSERT INTO task_feedback (task_id, feedback, rating) VALUES (?, ?, ?)',
+            (task_id, feedback, rating)
+        )
+        self.connection.commit() 
+
+    def add_bot_feedback(self, user_id: int, feedback: str):
+        """Add feedback about bot"""
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_feedback (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                feedback TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.cursor.execute(
+            'INSERT INTO bot_feedback (user_id, feedback) VALUES (?, ?)',
+            (user_id, feedback)
+        )
+        self.connection.commit()    
+        
+
 # Состояния FSM
 class RegistrationStates(StatesGroup):
     waiting_for_name = State()
@@ -211,6 +371,11 @@ class TaskCreationStates(StatesGroup):
     waiting_for_description = State()
     waiting_for_deadline = State()
     waiting_for_assignee = State()
+
+# Add to the States section
+class ProjectManagementStates(StatesGroup):
+    waiting_for_new_project_code = State()
+    confirm_project_deletion = State()
 
 
 # Клавиатуры
@@ -233,21 +398,28 @@ def get_role_keyboard() -> ReplyKeyboardMarkup:
 def get_main_keyboard(is_manager: bool = False) -> InlineKeyboardMarkup:
     buttons = [[
         InlineKeyboardButton(text="📋 Мои задачи", callback_data="show_tasks")
+    ],
+    [
+        InlineKeyboardButton(text="🔄 Сменить проект", callback_data="switch_project")
+    ],
+    [
+        InlineKeyboardButton(text="➕ Присоединиться к проекту", callback_data="join_project")
+    ],
+    [
+        InlineKeyboardButton(text="📝 Создать новый проект", callback_data="create_new_project")
+    ],
+    [
+        InlineKeyboardButton(text="📢 Оставить отзыв о боте", callback_data="bot_feedback")
     ]]
+    
     if is_manager:
-        buttons.extend(
-            [[
-                InlineKeyboardButton(text="✏️ Создать задачу",
-                                     callback_data="create_task")
-            ],
-             [
-                 InlineKeyboardButton(text="📊 Отчет по проекту",
-                                      callback_data="project_report")
-             ],
-             [
-                 InlineKeyboardButton(text="🔑 Узнать код проекта",
-                                      callback_data="get_project_code")
-             ]])
+        buttons.extend([
+            [InlineKeyboardButton(text="✏️ Создать задачу", callback_data="create_task")],
+            [InlineKeyboardButton(text="📊 Отчет по проекту", callback_data="project_report")],
+            [InlineKeyboardButton(text="👥 Участники проекта", callback_data="view_participants")],
+            [InlineKeyboardButton(text="🔑 Узнать код проекта", callback_data="get_project_code")],
+            [InlineKeyboardButton(text="❌ Удалить проект", callback_data="delete_project")]
+        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -261,15 +433,26 @@ def get_project_code_keyboard(project_code: str) -> InlineKeyboardMarkup:
 
 
 def get_task_inline_keyboard(task_id: int) -> InlineKeyboardMarkup:
-    buttons = [[
-        InlineKeyboardButton(text="✅ Отметить выполненной",
-                             callback_data=f"complete_task_{task_id}")
-    ],
-               [
-                   InlineKeyboardButton(
-                       text="📋 Детали",
-                       callback_data=f"task_details_{task_id}")
-               ]]
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="✅ Отметить выполненной",
+                callback_data=f"complete_task_{task_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📋 Детали",
+                callback_data=f"task_details_{task_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⭐ Оставить отзыв",
+                callback_data=f"leave_feedback_{task_id}"
+            )
+        ]
+    ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -496,9 +679,13 @@ async def process_name(message: Message, state: FSMContext):
 
 
 @router.message(Command("create"))
-async def cmd_create_project(message: Message, state: FSMContext):
+@router.callback_query(F.data == "create_new_project")
+async def cmd_create_project(event: Union[Message, CallbackQuery], state: FSMContext):
     await state.set_state(ProjectCreationStates.waiting_for_name)
-    await message.answer("Введите название нового проекта:")
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text("Введите название нового проекта:")
+    else:
+        await event.answer("Введите название нового проекта:")
 
 
 @router.message(ProjectCreationStates.waiting_for_name)
@@ -535,10 +722,19 @@ async def process_project_roles(message: Message, state: FSMContext, db: Databas
     for role in roles:
         db.add_project_role(project_id, role)
 
-    # Добавляем менеджера проекта с ролью Manager
-    db.add_user(message.from_user.id, message.from_user.full_name, project_id, "Manager")
+    try:
+        # Добавляем пользователя как менеджера проекта
+        db.add_user(message.from_user.id, message.from_user.full_name, project_id, "Manager")
+    except sqlite3.IntegrityError:
+        # Игнорируем ошибку уникального ключа, так как пользователь уже существует
+        pass
 
-    await state.clear()
+    await state.clear()    
+    
+    await message.answer(
+        "Для быстрого возврата в главное меню используйте кнопку ниже",
+        reply_markup=get_home_button()
+    )
     await message.answer(
         f"Проект '{project_name}' успешно создан!\n"
         f"Ваша роль: Manager\n"
@@ -549,9 +745,7 @@ async def process_project_roles(message: Message, state: FSMContext, db: Databas
         parse_mode="Markdown"
     )
 
-    await message.answer("Для быстрого возврата в главное меню используйте кнопку ниже",
-        reply_markup=get_home_button()
-    )
+
 
 
 @router.message(RegistrationStates.waiting_for_project_code)
@@ -695,7 +889,7 @@ async def cb_assign_task(callback: CallbackQuery, state: FSMContext,
 
 
 @router.message(TaskCreationStates.waiting_for_deadline)
-async def process_task_deadline(message: Message, state: FSMContext, db: Database, user: tuple):
+async def process_task_deadline(message: Message, state: FSMContext, db: Database, user: tuple, bot: Bot):
     try:
         deadline = datetime.strptime(message.text, '%d.%m.%Y %H:%M')
     except ValueError:
@@ -729,6 +923,16 @@ async def process_task_deadline(message: Message, state: FSMContext, db: Databas
 
         # Получаем информацию о выбранном исполнителе
         assignee = db.get_user_by_id(best_assignee)
+
+        await bot.send_message(
+            assignee[1],  # telegram_id
+            f"📢 Вам назначена новая задача!\n\n"
+            f"Описание: {task_data['description']}\n"
+            f"Дедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"Используйте меню 'Мои задачи' для просмотра деталей.",
+            reply_markup=get_task_inline_keyboard(task_id)
+        )
+
 
         await state.clear()
         await message.answer(
@@ -791,11 +995,11 @@ async def show_tasks(message: Message, db: Database, user: tuple):
 async def cb_show_tasks(callback: CallbackQuery, db: Database, user: tuple):
     await callback.message.delete()  # Удаляем предыдущее сообщение
 
-    tasks = db.get_tasks_by_user(user[0])
+    tasks = db.get_tasks_by_user(db.get_active_user(user[1])[0])
     if not tasks:
         await callback.message.answer(
             "У вас пока нет активных задач.",
-            reply_markup=get_main_keyboard(user[3] == "Manager"))
+            reply_markup=get_main_keyboard(db.get_active_role(user[1])[0] == "Manager"))
         return
 
     for task in tasks:
@@ -836,7 +1040,8 @@ async def complete_task(callback: CallbackQuery, db: Database, user: tuple):
 async def cb_project_report(callback: CallbackQuery, db: Database,
                             user: tuple):
     try:
-        project = db.get_project_by_id(user[4])
+        print(db.get_active_user(user[1]))
+        project = db.get_active_project(user[1])
         if not project:
             await callback.answer("Проект не найден.", show_alert=True)
             return
@@ -887,19 +1092,32 @@ async def cb_project_report(callback: CallbackQuery, db: Database,
 
 
 @router.callback_query(F.data == "get_project_code")
-async def cb_get_project_code(callback: CallbackQuery, db: Database,
-                              user: tuple):
-    project = db.get_project_by_id(user[4])
-    if project[3] != callback.from_user.id:
+async def cb_get_project_code(callback: CallbackQuery, db: Database, user: tuple):
+    # Get active project with role
+    active_project = db.get_user_active_project(callback.from_user.id)
+    if not active_project:
+        await callback.answer(
+            "Не удалось получить информацию о текущем проекте. Попробуйте переключить проект.",
+            show_alert=True
+        )
+        return
+
+    project_data = active_project[:-1]  # Project data without role
+    user_role = active_project[-1]  # User's role in the project
+
+    # Check if user is manager of this specific project
+    if project_data[3] != callback.from_user.id:
         await callback.answer(
             "Только руководитель проекта может просматривать код проекта.",
-            show_alert=True)
+            show_alert=True
+        )
         return
 
     await callback.message.edit_text(
-        f"Код вашего проекта:\n\n`{project[2]}`\n\nПоделитесь этим кодом с участниками команды.",
-        reply_markup=get_project_code_keyboard(project[2]),
-        parse_mode="Markdown")
+        f"Код вашего проекта:\n\n`{project_data[2]}`\n\nПоделитесь этим кодом с участниками команды.",
+        reply_markup=get_project_code_keyboard(project_data[2]),
+        parse_mode="Markdown"
+    )
     await callback.answer()
 
 
@@ -919,6 +1137,267 @@ async def cb_process_role(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+# Add these handlers to the router section
+@router.callback_query(F.data == "switch_project")
+async def cb_switch_project(callback: CallbackQuery, db: Database):
+    # Получаем список проектов пользователя
+    projects = db.get_user_projects(callback.from_user.id)
+
+    if not projects:
+        await callback.message.edit_text(
+            "У вас пока нет других проектов. Вы можете присоединиться к существующему проекту или создать новый.",
+            reply_markup=get_main_keyboard(False)
+        )
+        return
+
+    # Создаем клавиатуру со списком проектов
+    buttons = []
+    for project in projects:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{project[1]}",
+                callback_data=f"select_project_{project[0]}"
+            )
+        ])
+
+    # Добавляем кнопку возврата
+    buttons.append([
+        InlineKeyboardButton(
+            text="🔙 Вернуться",
+            callback_data="back_to_main"
+        )
+    ])
+
+    await callback.message.edit_text(
+        "Выберите проект:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@router.callback_query(F.data.startswith("select_project_"))
+async def cb_select_project(callback: CallbackQuery, db: Database):
+    project_id = int(callback.data.split("_")[-1])
+    db.switch_user_project(callback.from_user.id, project_id)
+    project = db.get_project_by_id(project_id)
+    is_manager = project[3] == callback.from_user.id
+    
+    await callback.message.edit_text(
+        f"Проект изменен на: {project[1]}",
+        reply_markup=get_main_keyboard(is_manager)
+    )
+
+@router.callback_query(F.data == "join_project")
+async def cb_join_project(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ProjectManagementStates.waiting_for_new_project_code)
+    await callback.message.edit_text(
+        "Введите код проекта, к которому хотите присоединиться:\n\n"
+        "Для отмены нажмите кнопку 'На главную'"
+    )
+
+
+@router.message(ProjectManagementStates.waiting_for_new_project_code)
+async def process_new_project_code(message: Message, state: FSMContext, db: Database):
+    project = db.get_project(message.text)
+    if not project:
+        await message.answer(
+            "Проект не найден. Попробуйте еще раз или нажмите 'На главную' для возврата в меню."
+        )
+        return
+
+    # Проверяем, не состоит ли пользователь уже в этом проекте
+    user_projects = db.get_user_projects(message.from_user.id)
+    if any(p[0] == project[0] for p in user_projects):
+        await message.answer(
+            "Вы уже состоите в этом проекте. Используйте функцию 'Сменить проект' для переключения между проектами.",
+            reply_markup=get_main_keyboard(False)
+        )
+        await state.clear()
+        return
+
+    # Получаем роли проекта
+    project_roles = db.get_project_roles(project[0])
+
+    if not project_roles:
+        await message.answer(
+            "В проекте не определены роли. Обратитесь к менеджеру проекта."
+        )
+        await state.clear()
+        return
+
+    # Создаем клавиатуру с ролями
+    buttons = [
+        [InlineKeyboardButton(text=role, callback_data=f"join_role_{project[0]}_{role}")]
+        for role in project_roles
+    ]
+
+    # Добавляем кнопку отмены
+    buttons.append([
+        InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_main")
+    ])
+
+    await message.answer(
+        f"Выберите вашу роль в проекте '{project[1]}':",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("join_role_"))
+async def process_join_role(callback: CallbackQuery, state: FSMContext, db: Database):
+    # Получаем project_id и role из callback_data
+    _, _, project_id, role = callback.data.split("_")
+    project_id = int(project_id)
+
+    try:
+        # Добавляем пользователя в новый проект
+        user_id = db.add_user(
+            callback.from_user.id,
+            callback.from_user.full_name,
+            project_id,
+            role
+        )
+
+        # Переключаем пользователя на новый проект
+        db.switch_user_project(callback.from_user.id, project_id)
+
+        # Получаем информацию о проекте
+        project = db.get_project_by_id(project_id)
+        is_manager = project[3] == callback.from_user.id
+
+        await state.clear()
+
+        await callback.message.edit_text(
+            f"✅ Вы успешно присоединились к проекту '{project[1]}'\n"
+            f"Ваша роль: {role}"
+        )
+
+        await callback.message.answer(
+            "Выберите действие:",
+            reply_markup=get_main_keyboard(is_manager)
+        )
+
+    except Exception as e:
+        logging.error(f"Error in process_join_role: {e}")
+        await callback.message.edit_text(
+            "Произошла ошибка при присоединении к проекту. Попробуйте еще раз.",
+            reply_markup=get_main_keyboard(False)
+        )
+        await state.clear()
+
+
+
+
+@router.callback_query(F.data == "delete_project")
+async def cb_delete_project(callback: CallbackQuery, state: FSMContext, db: Database):
+    project = db.get_project_by_id(db.get_user(callback.from_user.id)[4])
+    if project[3] != callback.from_user.id:
+        await callback.answer("Только владелец проекта может удалить его", show_alert=True)
+        return
+    
+    await state.set_state(ProjectManagementStates.confirm_project_deletion)
+    await callback.message.edit_text(
+        f"Вы уверены, что хотите удалить проект '{project[1]}'?\n"
+        "⚠️ Это действие нельзя отменить!\n\n"
+        "Для подтверждения напишите название проекта:"
+    )
+
+@router.message(ProjectManagementStates.confirm_project_deletion)
+async def confirm_project_deletion(message: Message, state: FSMContext, db: Database):
+    project = db.get_project_by_id(db.get_user(message.from_user.id)[4])
+    if message.text != project[1]:
+        await message.answer("Название проекта введено неверно. Операция отменена.")
+        await state.clear()
+        return
+    
+    if db.delete_project(project[0]):
+        await message.answer("Проект успешно удален.")
+    else:
+        await message.answer("Произошла ошибка при удалении проекта.")
+    
+    await state.clear()
+
+
+@router.callback_query(F.data == "create_new_project")
+async def cb_create_new_project(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ProjectCreationStates.waiting_for_name)
+    await callback.message.edit_text("Введите название нового проекта:")
+
+
+
+@router.callback_query(F.data == "view_participants")
+async def cb_view_participants(callback: CallbackQuery, db: Database):
+    # Get active project with role
+    active_project = db.get_user_active_project(callback.from_user.id)
+    if not active_project:
+        await callback.answer(
+            "Не удалось получить информацию о текущем проекте.",
+            show_alert=True
+        )
+        return
+    
+    project_data = active_project[:-2]  # Project data without role and user_id
+    user_role = active_project[-2]  # User's role
+    
+    # Check if user is manager of this project
+    if project_data[3] != callback.from_user.id:
+        await callback.answer(
+            "Только руководитель проекта может просматривать список участников.",
+            show_alert=True
+        )
+        return
+    
+    # Get project participants
+    participants = db.get_project_participants(project_data[0])
+    
+    if not participants:
+        message_text = f"В проекте '{project_data[1]}' пока нет участников."
+    else:
+        message_text = f"👥 Участники проекта '{project_data[1]}':\n\n"
+        current_role = None
+        
+        for name, role, _ in participants:
+            if role != current_role:
+                message_text += f"\n{role}:\n"
+                current_role = role
+            message_text += f"- {name}\n"
+    
+    # Add back button
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Вернуться", callback_data="back_to_main")]
+    ])
+    
+    await callback.message.edit_text(
+        message_text,
+        reply_markup=keyboard
+    )
+
+
+
+
+
+
+
+class FeedbackStates(StatesGroup):
+    waiting_for_bot_feedback = State()
+
+
+@router.callback_query(F.data == "bot_feedback")
+async def cb_bot_feedback(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(FeedbackStates.waiting_for_bot_feedback)
+    await callback.message.edit_text(
+        "Пожалуйста, поделитесь вашим мнением о работе бота.\n"
+        "Что можно улучшить? Какие функции добавить?\n"
+        "Ваш отзыв поможет сделать бота лучше!"
+    )
+
+@router.message(FeedbackStates.waiting_for_bot_feedback)
+async def process_bot_feedback(message: Message, state: FSMContext, db: Database):
+    db.add_bot_feedback(message.from_user.id, message.text)
+    await state.clear()
+    await message.answer(
+        "Спасибо за ваш отзыв! Мы учтем его для улучшения работы бота.",
+        reply_markup=get_main_keyboard(
+            db.get_project_by_id(db.get_user(message.from_user.id)[4])[3] == message.from_user.id
+        )
+    )
 
 @router.message()
 async def handle_unknown(message: Message, state: FSMContext):
